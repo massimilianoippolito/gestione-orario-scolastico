@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import time
+from collections import Counter
 from ortools.sat.python import cp_model
 
 class MotoreOrario:
@@ -62,7 +63,7 @@ class MotoreOrario:
         return classi, docenti, assegnazioni
 
     def genera(self, timeout_secondi=60):
-        print(f"🔄 Avvio motore CP-SAT Google OR-Tools (Ottimizzazione con eliminazione buchi)...")
+        print(f"🔄 Avvio motore CP-SAT Google OR-Tools (Ottimizzazione con blocchi flessibili avanzata)...")
         classi, docenti, assegnazioni = self._carica_dati()
         
         if not classi or not docenti or not assegnazioni:
@@ -73,6 +74,32 @@ class MotoreOrario:
         def norm(s):
             return s.lower().strip().replace('à', 'a').replace('è', 'e').replace('é', 'e').replace('ì', 'i').replace('ò', 'o').replace('ù', 'u')
 
+        # --- FUNZIONE INTERNA: Parser dei Blocchi Universale ---
+        def parse_blocchi(testo_pref, ore_totali):
+            if not testo_pref: 
+                return [1] * ore_totali
+            testo_norm = testo_pref.lower().strip()
+            
+            # Caso 1: Pattern personalizzato es. "3+1", "2+1+1"
+            if "+" in testo_norm:
+                try:
+                    parts = [int(p.strip()) for p in testo_norm.split("+")]
+                    if sum(parts) == ore_totali: 
+                        return parts
+                except:
+                    pass
+                    
+            # Caso 2: "Blocchi da 2" o semplicemente "2"
+            if "2" in testo_norm:
+                blocchi = [2] * (ore_totali // 2)
+                if ore_totali % 2 != 0: 
+                    blocchi.append(1)
+                return blocchi
+            
+            # Caso 3: Ore singole o Standard
+            return [1] * ore_totali
+        # -------------------------------------------------------
+
         x = {}
         slots_classe = {c: [] for c in classi}
         for c, dati_c in classi.items():
@@ -82,12 +109,14 @@ class MotoreOrario:
                     slots_classe[c].append((giorno, ora))
 
         assegnazione_vars = []
+        penalita_violazione_blocchi = []
         
         for idx_ass, ass in enumerate(assegnazioni):
             c = ass["classe"]
             m = ass["materia"]
             d = ass["docente"]
             ore_tot = ass["ore"]
+            pref_blocchi = ass.get("preferenza_blocchi", "")
             
             if c not in classi: 
                 continue
@@ -136,6 +165,77 @@ class MotoreOrario:
 
             assegnazione_vars.append((idx_ass, c, singoli_docenti, vars_cattedra))
 
+            # =========================================================
+            # LOGICA AVANZATA: FORMA DEI BLOCCHI (DAILY SHAPE)
+            # =========================================================
+            pattern_target = parse_blocchi(pref_blocchi, ore_tot)
+            target_counts = Counter(pattern_target)
+            
+            ore_giornaliere_vars = []
+            
+            for giorno in classi[c]["giorni"]:
+                num_ore_giorno = classi[c]["ore"].get(giorno, 6)
+                ore_oggi = []
+                start_oggi = []
+                
+                for ora in range(1, num_ore_giorno + 1):
+                    if (c, giorno, ora, idx_ass) in x:
+                        v_h = x[(c, giorno, ora, idx_ass)]
+                        ore_oggi.append(v_h)
+                        
+                        is_start = model.NewBoolVar(f"start_{idx_ass}_{giorno}_{ora}")
+                        if ora == 1 or (c, giorno, ora - 1, idx_ass) not in x:
+                            model.Add(is_start == v_h)
+                        else:
+                            v_prev = x[(c, giorno, ora - 1, idx_ass)]
+                            model.Add(is_start >= v_h - v_prev)
+                            model.Add(is_start <= v_h)
+                            model.Add(is_start <= 1 - v_prev)
+                        
+                        start_oggi.append(is_start)
+                        
+                if ore_oggi:
+                    sum_ore_oggi = model.NewIntVar(0, num_ore_giorno, f"sum_ore_{idx_ass}_{giorno}")
+                    model.Add(sum_ore_oggi == sum(ore_oggi))
+                    ore_giornaliere_vars.append(sum_ore_oggi)
+                    
+                    sum_starts_oggi = model.NewIntVar(0, num_ore_giorno, f"sum_starts_{idx_ass}_{giorno}")
+                    model.Add(sum_starts_oggi == sum(start_oggi))
+                    
+                    # DIVIETO DI FRAMMENTAZIONE
+                    is_active_day = model.NewBoolVar(f"active_{idx_ass}_{giorno}")
+                    model.Add(sum_ore_oggi >= 1).OnlyEnforceIf(is_active_day)
+                    model.Add(sum_ore_oggi == 0).OnlyEnforceIf(is_active_day.Not())
+                    
+                    extra_starts = model.NewIntVar(0, num_ore_giorno, f"extra_starts_{idx_ass}_{giorno}")
+                    model.Add(extra_starts == sum_starts_oggi - is_active_day)
+                    penalita_violazione_blocchi.append(extra_starts * 5000) 
+                    
+            # RISPETTO DELLA FORMA 
+            for k in range(1, ore_tot + 1):
+                target_k = target_counts.get(k, 0)
+                
+                days_with_k_vars = []
+                for d_idx, sum_var in enumerate(ore_giornaliere_vars):
+                    is_k = model.NewBoolVar(f"is_{k}_{idx_ass}_{d_idx}")
+                    is_less = model.NewBoolVar(f"less_{k}_{idx_ass}_{d_idx}")
+                    is_greater = model.NewBoolVar(f"great_{k}_{idx_ass}_{d_idx}")
+                    
+                    model.AddExactlyOne([is_k, is_less, is_greater])
+                    model.Add(sum_var == k).OnlyEnforceIf(is_k)
+                    model.Add(sum_var < k).OnlyEnforceIf(is_less)
+                    model.Add(sum_var > k).OnlyEnforceIf(is_greater)
+                    
+                    days_with_k_vars.append(is_k)
+                    
+                tot_days_with_k = model.NewIntVar(0, len(ore_giornaliere_vars), f"tot_days_{k}_{idx_ass}")
+                model.Add(tot_days_with_k == sum(days_with_k_vars))
+                
+                scarto_k = model.NewIntVar(0, len(ore_giornaliere_vars), f"scarto_{k}_{idx_ass}")
+                model.AddAbsEquality(scarto_k, tot_days_with_k - target_k)
+                
+                penalita_violazione_blocchi.append(scarto_k * 1000)
+
         # Vincolo 1: In ogni slot di una classe max 1 lezione
         for c, slots in slots_classe.items():
             for giorno, ora in slots:
@@ -176,7 +276,6 @@ class MotoreOrario:
                                 var_catt = x[(c, giorno, ora, idx_ass)]
                                 vars_docente_ora.append(var_catt)
                                 
-                                # Penalizziamo se questa ora è indesiderata
                                 if ora in ore_indesiderate_oggi:
                                     usa_indes = model.NewBoolVar(f"indes_{docente}_{giorno}_{ora}_{idx_ass}")
                                     model.Add(usa_indes == var_catt)
@@ -206,15 +305,17 @@ class MotoreOrario:
                     model.Add(span_giornaliero == ultimissima - primissima)
                     penalita_compattamento.append(span_giornaliero)
 
-        # Funzione Obiettivo Totale: Compattamento + Evitare ore indesiderate
-        tutte_le_penalita = penalita_compattamento + penalita_indesiderate
+        # =========================================================================
+        # Funzione Obiettivo Totale: Compattamento + Indesiderate + RISPETTO BLOCCHI
+        # =========================================================================
+        tutte_le_penalita = penalita_compattamento + penalita_indesiderate + penalita_violazione_blocchi
         if tutte_le_penalita:
             model.Minimize(sum(tutte_le_penalita))
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = float(timeout_secondi)
         
-        print("⚙️ Esecuzione ottimizzazione avanzata OR-Tools in corso (compattamento + indesiderate)...")
+        print("⚙️ Esecuzione ottimizzazione avanzata OR-Tools in corso...")
         status = solver.Solve(model)
 
         if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
