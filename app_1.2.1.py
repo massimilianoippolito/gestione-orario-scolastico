@@ -463,7 +463,7 @@ if st.session_state.get("ruolo") == "admin":
         del st.session_state["progetto_admin_impersonato"]
         st.rerun()
 else:
-    st.write(f"Utente attivo: **{st.session_state.username}** (Progetto in gestione: **{st.session_state.progetto_corrente}**) | v 1.2 beta")
+    st.write(f"Utente attivo: **{st.session_state.username}** (Progetto in gestione: **{st.session_state.progetto_corrente}**) | v 1.2.1 beta")
 
 # --- BARRA LATERALE ---
 with st.sidebar:
